@@ -1,43 +1,67 @@
-﻿#pragma kernel CSAverage
-#pragma kernel CSAverage PLATFORM_LINUX
+﻿#pragma kernel CSAggregate D3D11
+#pragma kernel CSAggregate
+#pragma kernel CSClear
 #pragma kernel CSRender
-#pragma kernel CSRender TRACE_SUN
 
-#include "Packages/com.looooong.srp.vxgi/ShaderLibrary/Structs/RadianceData.cginc"
 #include "Packages/com.looooong.srp.vxgi/ShaderLibrary/Structs/VoxelData.cginc"
+#include "Packages/com.looooong.srp.vxgi/ShaderLibrary/Structs/VoxelLightingData.hlsl"
 #include "Packages/com.looooong.srp.vxgi/ShaderLibrary/Radiances/Voxel.cginc"
 
+#define RADIANCE_PRECISION 256.0
+
+RWTexture3D<uint> RadianceRG;
+RWTexture3D<uint> RadianceBA;
+RWTexture3D<uint> RadianceCount;
 RWTexture3D<float4> Target;
-RWByteAddressBuffer RadianceBuffer;
 ConsumeStructuredBuffer<VoxelData> VoxelBuffer;
 
-[numthreads(8,8,8)]
-void CSAverage(uint3 id : SV_DispatchThreadID)
+[numthreads(4,4,4)]
+void CSAggregate(uint3 id : SV_DispatchThreadID)
 {
   if (any(id >= Resolution)) return;
 
-  RadianceData d;
-  d.Load(RadianceBuffer, id);
+  // FIXME
+  // It looks stupid, due to a bug in HLSL to GLSL translator (case 1241093).
+  // This is an only workaround I can think of.
+  uint rg = RadianceRG[id];
+  uint ba = RadianceBA.Load(id);
+  uint count = RadianceCount[id];
 
-  GroupMemoryBarrierWithGroupSync();
+  if (count > 0u) {
+    float4 color = uint4(
+      rg & 0xffff,
+      rg >> 16u,
+      ba & 0xffff,
+      ba >> 16u
+    ) / RADIANCE_PRECISION;
 
-  if (d.count > 0) {
-    Target[id] = d.color / d.count;
-
-    d.color = 0.0;
-    d.count = 0;
-    d.Store(RadianceBuffer, id);
-#ifdef PLATFORM_LINUX
-  } else Target[id] = 0.0;
+    Target[id] = color / count;
+  } else {
+#ifdef D3D11
+    // Write only when necessary
+    if (any(Target[id])) Target[id] = 0.0;
 #else
-  } else if (any(Target[id])) Target[id] = 0.0; // Write only when necessary
+    Target[id] = 0.0;
 #endif
+  }
 }
 
-[numthreads(128,1,1)]
+[numthreads(4,4,4)]
+void CSClear(uint3 id : SV_DispatchThreadID)
+{
+  if (any(id >= Resolution)) return;
+
+  RadianceRG[id] = 0u;
+  RadianceBA[id] = 0u;
+  RadianceCount[id] = 0u;
+}
+
+[numthreads(64,1,1)]
 void CSRender(uint id : SV_DispatchThreadID)
 {
   VoxelData data = VoxelBuffer.Consume();
+
+  DeviceMemoryBarrierWithGroupSync();
 
   if (!data.IsValid()) return;
 
@@ -46,14 +70,18 @@ void CSRender(uint id : SV_DispatchThreadID)
   float4 color = data.GetColor();
   float3 emission = data.GetEmission();
 
-  GroupMemoryBarrierWithGroupSync();
+  VoxelLightingData lightingData;
+  lightingData.color = color.rgb;
+  lightingData.voxelPosition = position;
+  lightingData.vecN = normal;
+  lightingData.Initialize();
 
-  RadianceData d;
-  d.color.rgb = emission + VoxelRadiance(position, normal, color.rgb);
-  d.color.a = 1.0;
-  d.count = 1;
+  color.rgb = emission + VoxelRadiance(lightingData);
+  color.a = saturate(color.a);
 
-  GroupMemoryBarrierWithGroupSync();
+  uint4 intColor = (uint4)round(color * RADIANCE_PRECISION);
 
-  d.InterlockedAdd(RadianceBuffer, data.GetPosition());
+  InterlockedAdd(RadianceRG[position], intColor.r | intColor.g << 16);
+  InterlockedAdd(RadianceBA[position], intColor.b | intColor.a << 16);
+  InterlockedAdd(RadianceCount[position], 1);
 }

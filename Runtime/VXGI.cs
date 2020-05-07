@@ -1,17 +1,26 @@
-﻿using UnityEngine;
+﻿using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Experimental.Rendering;
 
-[ExecuteInEditMode]
+[ExecuteAlways]
 [RequireComponent(typeof(Camera))]
+[AddComponentMenu("Rendering/VXGI")]
 public class VXGI : MonoBehaviour {
+  public readonly static ReadOnlyCollection<LightType> supportedLightTypes = new ReadOnlyCollection<LightType>(new[] { LightType.Point, LightType.Directional, LightType.Spot });
   public enum AntiAliasing { X1 = 1, X2 = 2, X4 = 4, X8 = 8 }
-  public enum Resolution { Low = 33, Medium = 65, High = 129, VeryHigh = 257 }
+  public enum Resolution { Low = 32, Medium = 64, High = 128, VeryHigh = 256 }
 
   public Vector3 center;
-  public Light sun;
   public AntiAliasing antiAliasing = AntiAliasing.X1;
   public Resolution resolution = Resolution.Medium;
+  [Tooltip(
+@"Box: fast, 2^n voxel resolution.
+Gaussian 3x3x3: fast, 2^n+1 voxel resolution (recommended).
+Gaussian 4x4x4: slow, 2^n voxel resolution."
+  )]
+  public Mipmapper.Mode mipmapFilterMode = Mipmapper.Mode.Gaussian3x3x3;
   [Range(.1f, 1f)]
   public float diffuseResolutionScale = 1f;
   [Range(1f, 100f)]
@@ -19,28 +28,28 @@ public class VXGI : MonoBehaviour {
   public bool throttleTracing = false;
   [Range(1f, 100f)]
   public float tracingRate = 10f;
-  public bool visualizeMipmap = false;
-  public VXGIRenderer.MipmapSampler mipmapSampler = VXGIRenderer.MipmapSampler.Linear;
-  [Range(0f, 9f)]
-  public float level = 1f;
-  [Range(.02f, 1f)]
-  public float step = .1f;
   public bool followCamera = false;
 
+  public bool resolutionPlusOne {
+    get { return mipmapFilterMode == Mipmapper.Mode.Gaussian3x3x3; }
+  }
   public float bufferScale {
-    get { return 64f / (_resolution - 1); }
+    get { return 64f / (_resolution - _resolution % 2); }
   }
   public float voxelSize {
-    get { return bound / (float)resolution; }
+    get { return bound / (_resolution - _resolution % 2); }
   }
   public int volume {
     get { return _resolution * _resolution * _resolution; }
   }
-  public ComputeBuffer radianceBuffer {
-    get { return _radianceBuffer; }
+  public new Camera camera {
+    get { return _camera; }
   }
   public ComputeBuffer voxelBuffer {
     get { return _voxelBuffer; }
+  }
+  public List<LightSource> lights {
+    get { return _lights; }
   }
   public Matrix4x4 voxelToWorld {
     get { return Matrix4x4.TRS(origin, Quaternion.identity, Vector3.one * voxelSize); }
@@ -77,8 +86,9 @@ public class VXGI : MonoBehaviour {
   float _previousTrace = 0f;
   Camera _camera;
   CommandBuffer _command;
-  ComputeBuffer _radianceBuffer;
+  ComputeBuffer _lightSources;
   ComputeBuffer _voxelBuffer;
+  List<LightSource> _lights;
   Mipmapper _mipmapper;
   Parameterizer _parameterizer;
   RenderTexture[] _radiances;
@@ -93,14 +103,16 @@ public class VXGI : MonoBehaviour {
   }
 
   public void Render(ScriptableRenderContext renderContext, Camera camera, VXGIRenderer renderer) {
+    VXGIRenderPipeline.TriggerCameraCallback(camera, "OnPreRender", Camera.onPreRender);
+
+    _command.BeginSample(_command.name);
+    renderContext.ExecuteCommandBuffer(_command);
+    _command.Clear();
+
     UpdateResolution();
 
     float realtime = Time.realtimeSinceStartup;
     bool tracingThrottled = throttleTracing;
-
-#if UNITY_EDITOR
-    tracingThrottled &= UnityEditor.EditorApplication.isPlaying;
-#endif
 
     if (tracingThrottled) {
       if (_previousTrace + 1f / tracingRate < realtime) {
@@ -122,14 +134,17 @@ public class VXGI : MonoBehaviour {
     renderContext.ExecuteCommandBuffer(_command);
     _command.Clear();
 
-    if (camera.clearFlags == CameraClearFlags.Skybox) renderContext.DrawSkybox(camera);
+    SetupShader(renderContext);
 
-    if (visualizeMipmap) {
-      renderer.RenderMipmap(renderContext, camera, this);
-    } else {
-      SetupShader(renderContext);
-      renderer.RenderDeferred(renderContext, camera, this);
-    }
+    VXGIRenderPipeline.TriggerCameraCallback(camera, "OnPreCull", Camera.onPreCull);
+
+    renderer.RenderDeferred(renderContext, camera, this);
+
+    _command.EndSample(_command.name);
+    renderContext.ExecuteCommandBuffer(_command);
+    _command.Clear();
+
+    VXGIRenderPipeline.TriggerCameraCallback(camera, "OnPostRender", Camera.onPostRender);
   }
 
   void PrePass(ScriptableRenderContext renderContext, VXGIRenderer renderer) {
@@ -149,22 +164,10 @@ public class VXGI : MonoBehaviour {
   }
 
   void SetupShader(ScriptableRenderContext renderContext) {
-    if ((sun != null) && (sun.isActiveAndEnabled)) {
-      Debug.Assert(sun.type == LightType.Directional, "The sun is not directional.", sun);
+    _lightSources.SetData(_lights);
 
-      _command.EnableShaderKeyword("TRACE_SUN");
-      _command.SetGlobalColor("SunColor", sun.color * sun.intensity);
-      _command.SetGlobalVector("SunDirection", sun.transform.forward);
-    } else {
-      _command.DisableShaderKeyword("TRACE_SUN");
-    }
-
-    _command.SetGlobalInt("LightCount", _voxelizer.lightColors.Count);
-
-    if (_voxelizer.lightColors.Count > 0) {
-      _command.SetGlobalVectorArray("LightColors", _voxelizer.lightColors);
-      _command.SetGlobalVectorArray("LightPositions", _voxelizer.lightPositions);
-    }
+    _command.SetGlobalInt("LightCount", _lights.Count);
+    _command.SetGlobalBuffer("LightSources", _lightSources);
 
     _command.SetGlobalInt("Resolution", _resolution);
     _command.SetGlobalMatrix("WorldToVoxel", worldToVoxel);
@@ -183,7 +186,9 @@ public class VXGI : MonoBehaviour {
     _resolution = (int)resolution;
 
     _camera = GetComponent<Camera>();
-    _command = new CommandBuffer { name = "VXGI" };
+    _command = new CommandBuffer { name = "VXGI.MonoBehaviour" };
+    _lights = new List<LightSource>(64);
+    _lightSources = new ComputeBuffer(64, LightSource.size);
     _mipmapper = new Mipmapper(this);
     _parameterizer = new Parameterizer();
     _voxelizer = new Voxelizer(this);
@@ -203,18 +208,17 @@ public class VXGI : MonoBehaviour {
     _voxelizer.Dispose();
     _parameterizer.Dispose();
     _mipmapper.Dispose();
+    _lightSources.Dispose();
     _command.Dispose();
   }
   #endregion
 
   #region Buffers
   void CreateBuffers() {
-    _radianceBuffer = new ComputeBuffer(5 * volume, 4, ComputeBufferType.Raw);
     _voxelBuffer = new ComputeBuffer((int)(bufferScale * volume), VoxelData.size, ComputeBufferType.Append);
   }
 
   void DisposeBuffers() {
-    _radianceBuffer.Dispose();
     _voxelBuffer.Dispose();
   }
 
@@ -236,15 +240,18 @@ public class VXGI : MonoBehaviour {
   }
 
   void CreateTextures() {
-    int currentResolution = _resolution;
-    _radianceDescriptor.height = _radianceDescriptor.width = _radianceDescriptor.volumeDepth = currentResolution;
+    int resolutionModifier = _resolution % 2;
 
-    _radiances = new RenderTexture[(int)Mathf.Log(_resolution - 1, 2)];
+    _radiances = new RenderTexture[(int)Mathf.Log(_resolution, 2f)];
 
-    for (int i = 0; i < _radiances.Length; i++) {
+    for (
+      int i = 0, currentResolution = _resolution;
+      i < _radiances.Length;
+      i++, currentResolution = (currentResolution - resolutionModifier) / 2 + resolutionModifier
+    ) {
+      _radianceDescriptor.height = _radianceDescriptor.width = _radianceDescriptor.volumeDepth = currentResolution;
       _radiances[i] = new RenderTexture(_radianceDescriptor);
       _radiances[i].Create();
-      _radianceDescriptor.height = _radianceDescriptor.width = _radianceDescriptor.volumeDepth = currentResolution = (currentResolution - 1) / 2 + 1;
     }
 
     for (int i = 0; i < 9; i++) {
@@ -256,6 +263,7 @@ public class VXGI : MonoBehaviour {
     foreach (var radiance in _radiances) {
       radiance.DiscardContents();
       radiance.Release();
+      DestroyImmediate(radiance);
     }
   }
 
@@ -266,8 +274,12 @@ public class VXGI : MonoBehaviour {
   #endregion
 
   void UpdateResolution() {
-    if (_resolution != (int)resolution) {
-      _resolution = (int)resolution;
+    int newResolution = (int)resolution;
+
+    if (resolutionPlusOne) newResolution++;
+
+    if (_resolution != newResolution) {
+      _resolution = newResolution;
       ResizeBuffers();
       ResizeTextures();
     }

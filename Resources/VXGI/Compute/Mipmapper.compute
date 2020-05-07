@@ -1,58 +1,148 @@
-﻿#pragma kernel CSFilter
-#pragma kernel CSFilter PLATFORM_LINUX
+﻿#pragma kernel CSFilter BOX_FILTER D3D11
+#pragma kernel CSFilter BOX_FILTER
+#pragma kernel CSFilter GAUSSIAN_3x3x3_FILTER D3D11
+#pragma kernel CSFilter GAUSSIAN_3x3x3_FILTER
+#pragma kernel CSFilter GAUSSIAN_4x4x4_FILTER D3D11
+#pragma kernel CSFilter GAUSSIAN_4x4x4_FILTER
 #pragma kernel CSShift
 
-#include "Packages/com.looooong.srp.vxgi/ShaderLibrary/Constants.cginc"
+#define FILTER_FACTOR 1.414214
 
-int DstRes;
-Texture3D<float4> Src;
-RWTexture3D<float4> Dst;
-static float Weights[4] = {
-  R_8,
-  R_16,
-  R_32,
-  R_64
+uint DstRes;
+Texture3D<half4> Src;
+RWTexture3D<half4> Dst;
+groupshared uint SharedSrcRG[10][10][10];
+groupshared uint SharedSrcBA[10][10][10];
+
+#if defined(GAUSSIAN_3x3x3_FILTER)
+#define FILTER_INDEX_MODIFIER 0u
+#define FILTER_THREADS 8u
+
+static const uint GaussianIndices[] = { 0u, 1u, 0u };
+static const float GaussianWeights[] = {
+  1.0 / 64.0,
+  2.0 / 64.0,
+  4.0 / 64.0,
+  8.0 / 64.0
 };
+#elif defined(GAUSSIAN_4x4x4_FILTER)
+#define FILTER_INDEX_MODIFIER 1u
+#define FILTER_THREADS 4u
 
-[numthreads(8,8,8)]
-void CSFilter(int3 id : SV_DispatchThreadID)
-{
-  if (any(id >= DstRes)) return;
+static const uint GaussianIndices[] = { 0u, 1u, 1u, 0u };
+static const float GaussianWeights[] = {
+  1.0 / 512.0,
+  3.0 / 512.0,
+  9.0 / 512.0,
+  27.0 / 512.0
+};
+#endif
 
-  half4 color = 0.0;
+void FilterOutput(uint3 id, half4 color) {
+#ifdef D3D11
+  if (any(color)) Dst[id] = FILTER_FACTOR * color;
+  else if (any(Dst[id])) Dst[id] = 0.0;
+#else
+  Dst[id] = FILTER_FACTOR * color;
+#endif
+}
+
+#if defined(BOX_FILTER)
+[numthreads(4,4,4)]
+void CSFilter(uint3 id : SV_DispatchThreadID) {
+  float4 color = 0.0;
+  uint3 index;
 
   [unroll]
-  for (int i = -1; i < 2; i++) {
+  for (index.x = 0u; index.x < 2u; index.x++) {
     [unroll]
-    for (int j = -1; j < 2; j++) {
+    for (index.y = 0u; index.y < 2u; index.y++) {
       [unroll]
-      for (int k = -1; k < 2; k++) {
-        color += Weights[abs(i) + abs(j) + abs(k)] * Src[2 * id + int3(i, j, k)];
-        GroupMemoryBarrierWithGroupSync();
+      for (index.z = 0u; index.z < 2u; index.z++) {
+        color += Src[mad(2u, id, index)];
       }
     }
   }
 
-  if (any(color)) Dst[id] = color * 2.0;
-#ifdef PLATFORM_LINUX
-  else Dst[id] = 0.0;
-#else
-  else if (any(Dst[id])) Dst[id] = 0.0;
-#endif
+  FilterOutput(id, color / 8.0);
 }
+#elif defined(GAUSSIAN_3x3x3_FILTER) || defined(GAUSSIAN_4x4x4_FILTER)
+float GaussianWeight(uint3 index) {
+  return GaussianWeights[GaussianIndices[index.x] + GaussianIndices[index.y] + GaussianIndices[index.z]];
+}
+
+uint3 GroupSharedIndex(uint3 groupId, uint3 index) {
+  return mad(1u + FILTER_INDEX_MODIFIER, groupId, index);
+}
+
+half4 LoadColor(uint3 index) {
+  uint rg = SharedSrcRG[index.x][index.y][index.z];
+  uint ba = SharedSrcBA[index.x][index.y][index.z];
+
+  return half4(
+    f16tof32(rg),
+    f16tof32(rg >> 16u),
+    f16tof32(ba),
+    f16tof32(ba >> 16u)
+  );
+}
+
+void StoreColor(uint3 index, half4 color) {
+  SharedSrcRG[index.x][index.y][index.z] = f32tof16(color.r) | (f32tof16(color.g) << 16u);
+  SharedSrcBA[index.x][index.y][index.z] = f32tof16(color.b) | (f32tof16(color.a) << 16u);
+}
+
+[numthreads(FILTER_THREADS, FILTER_THREADS, FILTER_THREADS)]
+void CSFilter(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupThreadId)
+{
+  uint3 index;
+  uint3 minIndex = 1u - (groupId == 0u);
+  uint3 maxIndex = 1u + (groupId == FILTER_THREADS - 1u) + FILTER_INDEX_MODIFIER;
+
+  [unroll]
+  for (index.x = minIndex.x; index.x <= maxIndex.x; index.x++) {
+    [unroll]
+    for (index.y = minIndex.y; index.y <= maxIndex.y; index.y++) {
+      [unroll]
+      for (index.z = minIndex.z; index.z <= maxIndex.z; index.z++) {
+        StoreColor(GroupSharedIndex(groupId, index), Src[int3(mad(2u, id, index)) - 1]);
+      }
+    }
+  }
+
+  GroupMemoryBarrierWithGroupSync();
+
+#ifdef GAUSSIAN_4x4x4_FILTER
+  if (any(id >= DstRes)) return;
+#endif
+
+  float4 color = 0.0;
+
+  [unroll]
+  for (index.x = 0u; index.x < 3u + FILTER_INDEX_MODIFIER; index.x++) {
+    [unroll]
+    for (index.y = 0u; index.y < 3u + FILTER_INDEX_MODIFIER; index.y++) {
+      [unroll]
+      for (index.z = 0u; index.z < 3u + FILTER_INDEX_MODIFIER; index.z++) {
+        color += GaussianWeight(index) * LoadColor(GroupSharedIndex(groupId, index));
+      }
+    }
+  }
+
+  FilterOutput(id, color);
+}
+#endif
 
 int3 Displacement;
 
-[numthreads(8,8,8)]
-void CSShift(int3 id : SV_DispatchThreadID)
+[numthreads(4,4,4)]
+void CSShift(uint3 id : SV_DispatchThreadID)
 {
   if (any(id >= DstRes)) return;
 
-  id.x = Displacement.x < 0 ? DstRes - 1 - id.x : id.x;
-  id.y = Displacement.y < 0 ? DstRes - 1 - id.y : id.y;
-  id.z = Displacement.z < 0 ? DstRes - 1 - id.z : id.z;
+  id.x = Displacement.x < 0 ? DstRes - 1u - id.x : id.x;
+  id.y = Displacement.y < 0 ? DstRes - 1u - id.y : id.y;
+  id.z = Displacement.z < 0 ? DstRes - 1u - id.z : id.z;
 
-  Dst[id] = Dst[id + Displacement];
-
-  GroupMemoryBarrierWithGroupSync();
+  Dst[id] = Dst[int3(id) + Displacement];
 }

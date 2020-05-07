@@ -11,125 +11,171 @@ public class VoxelShader : System.IDisposable {
     }
   }
 
-  int _kernelAverage;
+  const string sampleCleanup = "Cleanup";
+  const string sampleComputeAggregate = "Compute.Aggregate";
+  const string sampleComputeClear = "Compute.Clear";
+  const string sampleComputeRender = "Compute.Render";
+  const string sampleSetup = "Setup";
+
+  int _kernelAggregate;
+  int _kernelClear;
   int _kernelRender;
-  int _propLightColors;
-  int _propLightPositions;
-  int _propRadianceBuffer;
+  int _propLightCount;
+  int _propLightSources;
+  int _propRadianceBA;
+  int _propRadianceRG;
+  int _propRadianceCount;
   int _propResolution;
-  int _propSunColor;
-  int _propSunDirection;
   int _propTarget;
   int _propVoxelBuffer;
-  VXGI _vxgi;
-  CommandBuffer _commandAverage;
-  CommandBuffer _commandRender;
+  CommandBuffer _command;
   ComputeBuffer _arguments;
+  ComputeBuffer _lightSources;
   ComputeShader _compute;
-  NumThreads _threadsAverage;
+  NumThreads _threadsAggregate;
+  NumThreads _threadsClear;
   NumThreads _threadsTrace;
+  RenderTextureDescriptor _descriptor;
+  VXGI _vxgi;
 
   public VoxelShader(VXGI vxgi) {
     _vxgi = vxgi;
 
-    _commandAverage = new CommandBuffer { name = "VoxelShader.Average" };
-    _commandRender = new CommandBuffer { name = "VoxelShader.Render" };
+    _command = new CommandBuffer { name = "VXGI.VoxelShader" };
 
     _arguments = new ComputeBuffer(3, sizeof(int), ComputeBufferType.IndirectArguments);
     _arguments.SetData(new int[] { 1, 1, 1 });
+    _lightSources = new ComputeBuffer(64, LightSource.size);
 
-    if (Application.platform == RuntimePlatform.LinuxEditor || Application.platform == RuntimePlatform.LinuxPlayer) {
-      _kernelAverage = 1;
-    } else {
-      _kernelAverage = 0;
-    }
-
+    _kernelAggregate = VXGIRenderPipeline.isD3D11Supported ? 0 : 1;
+    _kernelClear = compute.FindKernel("CSClear");
     _kernelRender = compute.FindKernel("CSRender");
 
-    _propLightColors = Shader.PropertyToID("LightColors");
-    _propLightPositions = Shader.PropertyToID("LightPositions");
-    _propRadianceBuffer = Shader.PropertyToID("RadianceBuffer");
+    _propLightCount = Shader.PropertyToID("LightCount");
+    _propLightSources = Shader.PropertyToID("LightSources");
+    _propRadianceBA = Shader.PropertyToID("RadianceBA");
+    _propRadianceRG = Shader.PropertyToID("RadianceRG");
+    _propRadianceCount = Shader.PropertyToID("RadianceCount");
     _propResolution = Shader.PropertyToID("Resolution");
-    _propSunColor = Shader.PropertyToID("SunColor");
-    _propSunDirection = Shader.PropertyToID("SunDirection");
     _propTarget = Shader.PropertyToID("Target");
     _propVoxelBuffer = Shader.PropertyToID("VoxelBuffer");
 
-    _threadsAverage = new NumThreads(compute, _kernelAverage);
+    _threadsAggregate = new NumThreads(compute, _kernelAggregate);
+    _threadsClear = new NumThreads(compute, _kernelClear);
     _threadsTrace = new NumThreads(compute, _kernelRender);
 
-    compute.SetVectorArray(_propLightColors, new Vector4[64]);
-    compute.SetVectorArray(_propLightPositions, new Vector4[64]);
+    _descriptor = new RenderTextureDescriptor() {
+      colorFormat = RenderTextureFormat.RInt,
+      dimension = TextureDimension.Tex3D,
+      enableRandomWrite = true,
+      msaaSamples = 1,
+      sRGB = false
+    };
   }
 
   public void Dispose() {
     _arguments.Dispose();
-    _commandRender.Dispose();
-    _commandAverage.Dispose();
+    _command.Dispose();
+    _lightSources.Dispose();
   }
 
   public void Render(ScriptableRenderContext renderContext) {
-#if UNITY_EDITOR
-    _threadsAverage = new NumThreads(compute, _kernelAverage);
-    _threadsTrace = new NumThreads(compute, _kernelRender);
-#endif
+    Setup();
+    ComputeClear();
+    ComputeRender();
+    ComputeAggregate();
+    Cleanup();
 
-    var radiances = _vxgi.radiances;
+    renderContext.ExecuteCommandBuffer(_command);
+    _command.Clear();
+  }
 
-    _commandRender.BeginSample(_commandRender.name);
+  void Cleanup()
+  {
+    _command.BeginSample(sampleCleanup);
 
-    _commandRender.SetComputeIntParam(compute, _propResolution, (int)_vxgi.resolution);
+    _command.ReleaseTemporaryRT(_propRadianceBA);
+    _command.ReleaseTemporaryRT(_propRadianceRG);
+    _command.ReleaseTemporaryRT(_propRadianceCount);
 
-    _commandRender.CopyCounterValue(_vxgi.voxelBuffer, _arguments, 0);
-    _vxgi.parameterizer.Parameterize(_commandRender, _arguments, _threadsTrace);
+    _command.EndSample(sampleCleanup);
+  }
 
-    if ((_vxgi.sun != null) && (_vxgi.sun.isActiveAndEnabled)) {
-      Debug.Assert(_vxgi.sun.type == LightType.Directional, "The sun is not directional.", _vxgi.sun);
+  void ComputeAggregate() {
+    _command.BeginSample(sampleComputeAggregate);
 
-      _kernelRender = 3;
-      _commandRender.SetComputeVectorParam(compute, _propSunColor, _vxgi.sun.color * _vxgi.sun.intensity);
-      _commandRender.SetComputeVectorParam(compute, _propSunDirection, _vxgi.sun.transform.forward);
-    } else {
-      _kernelRender = 2;
-    }
-
-    _commandRender.SetGlobalInt("LightCount", _vxgi.voxelizer.lightColors.Count);
-
-    if (_vxgi.voxelizer.lightColors.Count > 0) {
-      _commandRender.SetComputeVectorArrayParam(compute, _propLightColors, _vxgi.voxelizer.lightColors.ToArray());
-      _commandRender.SetComputeVectorArrayParam(compute, _propLightPositions, _vxgi.voxelizer.lightPositions.ToArray());
-    }
-
-    for (var i = 0; i < 9; i++) {
-      _commandRender.SetComputeTextureParam(compute, _kernelRender, "Radiance" + i, radiances[Mathf.Min(i, radiances.Length - 1)]);
-    }
-
-    _commandRender.SetComputeMatrixParam(compute, "VoxelToWorld", _vxgi.voxelToWorld);
-    _commandRender.SetComputeMatrixParam(compute, "WorldToVoxel", _vxgi.worldToVoxel);
-    _commandRender.SetComputeBufferParam(compute, _kernelRender, _propVoxelBuffer, _vxgi.voxelBuffer);
-    _commandRender.SetComputeBufferParam(compute, _kernelRender, _propRadianceBuffer, _vxgi.radianceBuffer);
-    _commandRender.DispatchCompute(compute, _kernelRender, _arguments, 0);
-
-    _commandRender.EndSample(_commandRender.name);
-
-    renderContext.ExecuteCommandBuffer(_commandRender);
-
-    _commandRender.Clear();
-
-    _commandAverage.BeginSample(_commandAverage.name);
-
-    _commandAverage.SetComputeBufferParam(compute, _kernelAverage, _propRadianceBuffer, _vxgi.radianceBuffer);
-    _commandAverage.SetComputeTextureParam(compute, _kernelAverage, _propTarget, radiances[0]);
-    _commandAverage.DispatchCompute(compute, _kernelAverage,
-      Mathf.CeilToInt((float)_vxgi.resolution / _threadsAverage.x),
-      Mathf.CeilToInt((float)_vxgi.resolution / _threadsAverage.y),
-      Mathf.CeilToInt((float)_vxgi.resolution / _threadsAverage.z)
+    _command.SetComputeTextureParam(compute, _kernelAggregate, _propRadianceBA, _propRadianceBA);
+    _command.SetComputeTextureParam(compute, _kernelAggregate, _propRadianceRG, _propRadianceRG);
+    _command.SetComputeTextureParam(compute, _kernelAggregate, _propRadianceCount, _propRadianceCount);
+    _command.SetComputeTextureParam(compute, _kernelAggregate, _propTarget, _vxgi.radiances[0]);
+    _command.DispatchCompute(compute, _kernelAggregate,
+      Mathf.CeilToInt((float)_vxgi.resolution / _threadsAggregate.x),
+      Mathf.CeilToInt((float)_vxgi.resolution / _threadsAggregate.y),
+      Mathf.CeilToInt((float)_vxgi.resolution / _threadsAggregate.z)
     );
 
-    _commandAverage.EndSample(_commandAverage.name);
+    _command.EndSample(sampleComputeAggregate);
+  }
 
-    renderContext.ExecuteCommandBuffer(_commandAverage);
+  void ComputeClear() {
+    _command.BeginSample(sampleComputeClear);
 
-    _commandAverage.Clear();
+    _command.SetComputeTextureParam(compute, _kernelClear, _propRadianceBA, _propRadianceBA);
+    _command.SetComputeTextureParam(compute, _kernelClear, _propRadianceRG, _propRadianceRG);
+    _command.SetComputeTextureParam(compute, _kernelClear, _propRadianceCount, _propRadianceCount);
+    _command.DispatchCompute(compute, _kernelClear,
+      Mathf.CeilToInt((float)_vxgi.resolution / _threadsClear.x),
+      Mathf.CeilToInt((float)_vxgi.resolution / _threadsClear.y),
+      Mathf.CeilToInt((float)_vxgi.resolution / _threadsClear.z)
+    );
+
+    _command.EndSample(sampleComputeClear);
+  }
+
+  void ComputeRender() {
+    _command.BeginSample(sampleComputeRender);
+
+    _lightSources.SetData(_vxgi.lights);
+
+    _command.SetComputeIntParam(compute, _propResolution, (int)_vxgi.resolution);
+    _command.SetComputeIntParam(compute, _propLightCount, _vxgi.lights.Count);
+    _command.SetComputeBufferParam(compute, _kernelRender, _propLightSources, _lightSources);
+    _command.SetComputeBufferParam(compute, _kernelRender, _propVoxelBuffer, _vxgi.voxelBuffer);
+    _command.SetComputeMatrixParam(compute, "VoxelToWorld", _vxgi.voxelToWorld);
+    _command.SetComputeMatrixParam(compute, "WorldToVoxel", _vxgi.worldToVoxel);
+    _command.SetComputeTextureParam(compute, _kernelRender, _propRadianceBA, _propRadianceBA);
+    _command.SetComputeTextureParam(compute, _kernelRender, _propRadianceRG, _propRadianceRG);
+    _command.SetComputeTextureParam(compute, _kernelRender, _propRadianceCount, _propRadianceCount);
+
+    for (var i = 0; i < 9; i++) {
+      _command.SetComputeTextureParam(compute, _kernelRender, "Radiance" + i, _vxgi.radiances[Mathf.Min(i, _vxgi.radiances.Length - 1)]);
+    }
+
+    _command.CopyCounterValue(_vxgi.voxelBuffer, _arguments, 0);
+    _vxgi.parameterizer.Parameterize(_command, _arguments, _threadsTrace);
+    _command.DispatchCompute(compute, _kernelRender, _arguments, 0);
+
+    _command.EndSample(sampleComputeRender);
+  }
+
+  void Setup()
+  {
+    _command.BeginSample(sampleSetup);
+
+    UpdateNumThreads();
+    _descriptor.height = _descriptor.width = _descriptor.volumeDepth = (int)_vxgi.resolution;
+    _command.GetTemporaryRT(_propRadianceCount, _descriptor);
+    _command.GetTemporaryRT(_propRadianceBA, _descriptor);
+    _command.GetTemporaryRT(_propRadianceRG, _descriptor);
+
+    _command.EndSample(sampleSetup);
+  }
+
+  [System.Diagnostics.Conditional("UNITY_EDITOR")]
+  void UpdateNumThreads()
+  {
+    _threadsAggregate = new NumThreads(compute, _kernelAggregate);
+    _threadsClear = new NumThreads(compute, _kernelClear);
+    _threadsTrace = new NumThreads(compute, _kernelRender);
   }
 }

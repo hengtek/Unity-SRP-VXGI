@@ -13,28 +13,34 @@
     float3 radiance = 0.0;
 
     for (uint i = 0; i < LightCount; i++) {
-      float3 lightPosition = LightPositions[i];
-      float3 relativePosition = lightPosition - data.worldPosition;
-      data.Prepare(normalize(relativePosition));
+      LightSource lightSource = LightSources[i];
 
-      if (data.NdotL <= 0.0) continue;
+      bool notInRange;
+      float3 localPosition;
 
-      float3 attenuation = data.NdotL * LightAttenuation(LightColors[i], relativePosition);
+      [branch]
+      if (lightSource.type == LIGHT_SOURCE_TYPE_DIRECTIONAL) {
+        localPosition = -lightSource.direction;
+        notInRange = false;
+        lightSource.voxelPosition = mad(localPosition, Resolution << 1, data.voxelPosition);
+      } else {
+        localPosition = lightSource.worldposition - data.worldPosition;
+        notInRange = lightSource.NotInRange(localPosition);
+      }
 
-      if (all(attenuation < 0.01)) continue;
+      data.Prepare(normalize(localPosition));
 
-      lightPosition = mul(WorldToVoxel, float4(lightPosition, 1.0)).xyz;
-      radiance += VoxelVisibility(data.voxelPosition + data.vecN, lightPosition) * GeneralBRDF(data) * attenuation;
+      float spotFalloff = lightSource.SpotFalloff(-data.vecL);
+
+      if (notInRange || (spotFalloff <= 0.0) || (data.NdotL <= 0.0)) continue;
+
+      radiance +=
+        VoxelVisibility(data.voxelPosition + data.vecN, lightSource.voxelPosition)
+        * GeneralBRDF(data)
+        * data.NdotL
+        * spotFalloff
+        * lightSource.Attenuation(localPosition);
     }
-
-#ifdef TRACE_SUN
-    data.Prepare(-SunDirection);
-    float3 attenuation = data.NdotL * SunColor;
-
-    if (any(attenuation >= 0.05)) {
-      radiance += VoxelVisibility(data.voxelPosition + data.vecN, mad(data.vecL, Resolution << 1, data.voxelPosition)) * GeneralBRDF(data) * attenuation;
-    }
-#endif
 
     return radiance;
   }
